@@ -4,6 +4,10 @@ var builder = WebApplication.CreateBuilder(args);
 
 // Add services to the container.
 builder.Services.AddControllersWithViews();
+
+// PdfStructuralAnalysisService adalah stateless (tidak menyimpan state antar request),
+// sehingga aman di-register sebagai singleton untuk efisiensi.
+builder.Services.AddSingleton<PdfStructuralAnalysisService>();
 builder.Services.AddScoped<GeminiService>();
 
 var app = builder.Build();

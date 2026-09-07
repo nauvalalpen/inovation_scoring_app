@@ -20,11 +20,16 @@ public class GeminiService
 
     private readonly IConfiguration _configuration;
     private readonly ILogger<GeminiService> _logger;
+    private readonly PdfStructuralAnalysisService _pdfAnalysisService;
 
-    public GeminiService(IConfiguration configuration, ILogger<GeminiService> logger)
+    public GeminiService(
+        IConfiguration configuration,
+        ILogger<GeminiService> logger,
+        PdfStructuralAnalysisService pdfAnalysisService)
     {
         _configuration = configuration;
         _logger = logger;
+        _pdfAnalysisService = pdfAnalysisService;
     }
 
     public async Task<AssessmentResult> AnalyzeDocumentAsync(IFormFile file, CancellationToken cancellationToken = default)
@@ -54,6 +59,20 @@ public class GeminiService
         }
 
         var pdfBytes = await ReadPdfAsync(file);
+
+        // ── Analisis struktural deterministik (PdfPig, tanpa LLM) ──────────────
+        _logger.LogInformation("Menjalankan analisis struktural PDF...");
+        var pdfAnalysis = _pdfAnalysisService.Analyze(pdfBytes);
+        _logger.LogInformation(
+            "Analisis PDF selesai: {TotalPages} halaman, {Candidates} kandidat redundansi.",
+            pdfAnalysis.TotalPages,
+            pdfAnalysis.RedundancyCandidates.Count);
+
+        // Bangun blok data teknis yang akan di-append ke Master Prompt
+        var technicalDataBlock = BuildTechnicalDataBlock(pdfAnalysis);
+        var fullPrompt = MasterPrompt + technicalDataBlock;
+        // ─────────────────────────────────────────────────────────────────────
+
         var requestBody = new
         {
             contents = new[]
@@ -71,7 +90,7 @@ public class GeminiService
                                 data = Convert.ToBase64String(pdfBytes)
                             }
                         },
-                        new { text = MasterPrompt }
+                        new { text = fullPrompt }
                     }
                 }
             },
@@ -104,6 +123,13 @@ public class GeminiService
 
                 var generatedJson = ExtractGeneratedText(responseBody);
                 var assessment = DeserializeAssessment(generatedJson);
+
+                // ── Override field deterministik dengan hasil C# yang otoritatif ──
+                // Field ini selalu akurat terlepas dari apa yang ditulis Gemini.
+                // Anomalies dan RedundantContent tetap dari Gemini (judgment semantik).
+                OverrideWithDeterministicData(assessment, pdfAnalysis);
+                // ────────────────────────────────────────────────────────────────
+
                 ValidateAssessment(assessment);
 
                 return assessment;
@@ -329,6 +355,124 @@ public class GeminiService
         }
     }
 
+
+    // -----------------------------------------------------------------------
+    // Helper: bangun blok data teknis untuk di-append ke MasterPrompt
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// Membangun blok teks berisi data teknis terukur (jumlah halaman, karakter
+    /// per halaman, kandidat redundansi) yang akan disisipkan ke prompt Gemini
+    /// sebagai ground truth wajib. Blok ini di-append SETELAH MasterPrompt;
+    /// isi MasterPrompt tidak diubah sama sekali.
+    /// </summary>
+    private static string BuildTechnicalDataBlock(PdfStructuralAnalysis analysis)
+    {
+        var sb = new StringBuilder();
+
+        sb.AppendLine();
+        sb.AppendLine();
+        sb.AppendLine("---");
+        sb.AppendLine();
+        sb.AppendLine("DATA TEKNIS TERUKUR (WAJIB DIPAKAI APA ADANYA — JANGAN DIHITUNG/DITEBAK ULANG)");
+        sb.AppendLine();
+        sb.AppendLine($"Total halaman aktual file PDF: {analysis.TotalPages}");
+        sb.AppendLine();
+        sb.AppendLine("Jumlah karakter teks dan status tiap halaman (hasil ekstraksi deterministik C#, bukan estimasi visual):");
+        sb.AppendLine("Format: [Halaman X] characterCount=N | hasVisualContent=true/false | isBlank=true/false");
+
+        foreach (var page in analysis.Pages)
+        {
+            sb.AppendLine(
+                $"[Halaman {page.Page}] characterCount={page.CharacterCount} | " +
+                $"hasVisualContent={page.HasVisualContent.ToString().ToLowerInvariant()} | " +
+                $"isBlank={page.IsBlank.ToString().ToLowerInvariant()}");
+        }
+
+        sb.AppendLine();
+        sb.AppendLine(
+            "Gunakan angka-angka di atas PERSIS ASIS untuk mengisi field berikut di JSON output:");
+        sb.AppendLine(
+            "- totalPagesUploaded = angka total halaman yang tertera di atas (jangan dihitung ulang dari PDF).");
+        sb.AppendLine(
+            "- pageCharacterCounts: untuk tiap halaman, gunakan characterCount dari data di atas (jangan estimasi sendiri).");
+        sb.AppendLine(
+            "- isBlank tiap halaman: gunakan nilai isBlank dari data di atas. Definisi sudah diterapkan: " +
+            "isBlank=true hanya jika characterCount=0 DAN hasVisualContent=false. " +
+            "Halaman berisi gambar/diagram tanpa teks memiliki isBlank=false meski characterCount=0.");
+        sb.AppendLine(
+            "- totalBlankPages dan blankPageNumbers: hitung dari entri di atas yang memiliki isBlank=true.");
+
+        if (analysis.RedundancyCandidates.Count > 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine(
+                "Sistem telah mendeteksi kandidat pasangan halaman dengan kemiripan teks tinggi " +
+                "secara algoritmik (Jaccard similarity atas word-shingles n=5, setelah membuang " +
+                "header/footer universal). Berikut kandidatnya (diurutkan dari kemiripan tertinggi):");
+
+            foreach (var cand in analysis.RedundancyCandidates)
+            {
+                sb.AppendLine(
+                    $"  Halaman {cand.PageA} ↔ Halaman {cand.PageB}: " +
+                    $"skor kemiripan={cand.SimilarityScore:F3} | " +
+                    $"cuplikan teks: \"{cand.MatchedExcerpt}\"");
+            }
+
+            sb.AppendLine();
+            sb.AppendLine(
+                "Untuk setiap kandidat di atas, nilai secara SEMANTIK apakah ini benar-benar " +
+                "redundansi mencurigakan (copy-paste konten tanpa penyesuaian substansial, " +
+                "sesuai definisi Bagian 2B poin 5), atau kemiripan yang wajar (misalnya karena " +
+                "memang membahas hal yang sama secara legitimate). " +
+                "Tetap cari juga redundansi lain yang mungkin tidak tertangkap algoritma ini " +
+                "(mis. redundansi visual berupa gambar identik, atau tabel yang disalin). " +
+                "Catat temuan ke field redundantContent di JSON sesuai instruksi Bagian 2B poin 5.");
+        }
+        else
+        {
+            sb.AppendLine();
+            sb.AppendLine(
+                "Analisis algoritmik tidak menemukan kandidat pasangan halaman dengan kemiripan " +
+                "teks tinggi (di bawah threshold 0.65). Tetap periksa redundansi visual " +
+                "(gambar/tabel identik antar halaman) secara mandiri sesuai Bagian 2B poin 5.");
+        }
+
+        sb.AppendLine();
+        sb.AppendLine("---");
+
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Override field-field yang bisa dihitung secara deterministik dari C#
+    /// dengan nilai otoritatif dari PdfStructuralAnalysisService.
+    /// Field Anomalies dan RedundantContent tetap dari Gemini (judgment semantik).
+    /// </summary>
+    private static void OverrideWithDeterministicData(
+        AssessmentResult assessment,
+        PdfStructuralAnalysis analysis)
+    {
+        var da = assessment.DocumentAnalysis;
+
+        // Override total halaman
+        da.TotalPagesUploaded = analysis.TotalPages;
+
+        // Override pageCharacterCounts dengan data eksak dari PdfPig
+        da.PageCharacterCounts = analysis.Pages
+            .Select(p => new AssessmentResult.PageCharacterCount
+            {
+                Page = p.Page,
+                CharacterCount = p.CharacterCount,
+                IsBlank = p.IsBlank,
+            })
+            .ToList();
+
+        // Override halaman kosong berdasarkan definisi deterministik
+        var blankPages = analysis.Pages.Where(p => p.IsBlank).ToList();
+        da.TotalBlankPages = blankPages.Count;
+        da.BlankPageNumbers = blankPages.Select(p => p.Page).ToList();
+    }
 
     private const string MasterPrompt = """
   
